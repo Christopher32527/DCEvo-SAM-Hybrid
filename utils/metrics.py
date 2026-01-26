@@ -1,397 +1,314 @@
-import math
-import warnings
-from pathlib import Path
+"""
+图像融合评估指标
+包含信息熵(EN)、空间频率(SF)、结构相似性(SSIM)、互信息(MI)等
 
-import matplotlib.pyplot as plt
-import numpy as np
+作者: Christopher32527
+邮箱: 2546507517@qq.com
+"""
+
 import torch
-
-from utils import TryExcept, threaded
-
-
-def fitness(x):
-    # Model fitness as a weighted combination of metrics
-    w = [0.0, 0.0, 0.1, 0.9]  # weights for [P, R, mAP@0.5, mAP@0.5:0.95]
-    return (x[:, :4] * w).sum(1)
+import torch.nn.functional as F
+import numpy as np
+import math
 
 
-def smooth(y, f=0.05):
-    # Box filter of fraction f
-    nf = round(len(y) * f * 2) // 2 + 1  # number of filter elements (must be odd)
-    p = np.ones(nf // 2)  # ones padding
-    yp = np.concatenate((p * y[0], y, p * y[-1]), 0)  # y padded
-    return np.convolve(yp, np.ones(nf) / nf, mode='valid')  # y-smoothed
-
-
-def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names=(), eps=1e-16, prefix=""):
-    """ Compute the average precision, given the recall and precision curves.
-    Source: https://github.com/rafaelpadilla/Object-Detection-Metrics.
-    # Arguments
-        tp:  True positives (nparray, nx1 or nx10).
-        conf:  Objectness value from 0-1 (nparray).
-        pred_cls:  Predicted object classes (nparray).
-        target_cls:  True object classes (nparray).
-        plot:  Plot precision-recall curve at mAP@0.5
-        save_dir:  Plot save directory
-    # Returns
-        The average precision as computed in py-faster-rcnn.
+def calculate_entropy(img):
     """
-
-    # Sort by objectness
-    i = np.argsort(-conf)
-    tp, conf, pred_cls = tp[i], conf[i], pred_cls[i]
-
-    # Find unique classes
-    unique_classes, nt = np.unique(target_cls, return_counts=True)
-    nc = unique_classes.shape[0]  # number of classes, number of detections
-
-    # Create Precision-Recall curve and compute AP for each class
-    px, py = np.linspace(0, 1, 1000), []  # for plotting
-    ap, p, r = np.zeros((nc, tp.shape[1])), np.zeros((nc, 1000)), np.zeros((nc, 1000))
-    for ci, c in enumerate(unique_classes):
-        i = pred_cls == c
-        n_l = nt[ci]  # number of labels
-        n_p = i.sum()  # number of predictions
-        if n_p == 0 or n_l == 0:
-            continue
-
-        # Accumulate FPs and TPs
-        fpc = (1 - tp[i]).cumsum(0)
-        tpc = tp[i].cumsum(0)
-
-        # Recall
-        recall = tpc / (n_l + eps)  # recall curve
-        r[ci] = np.interp(-px, -conf[i], recall[:, 0], left=0)  # negative x, xp because xp decreases
-
-        # Precision
-        precision = tpc / (tpc + fpc)  # precision curve
-        p[ci] = np.interp(-px, -conf[i], precision[:, 0], left=1)  # p at pr_score
-
-        # AP from recall-precision curve
-        for j in range(tp.shape[1]):
-            ap[ci, j], mpre, mrec = compute_ap(recall[:, j], precision[:, j])
-            if plot and j == 0:
-                py.append(np.interp(px, mrec, mpre))  # precision at mAP@0.5
-
-    # Compute F1 (harmonic mean of precision and recall)
-    f1 = 2 * p * r / (p + r + eps)
-    names = [v for k, v in names.items() if k in unique_classes]  # list: only classes that have data
-    names = dict(enumerate(names))  # to dict
-    if plot:
-        plot_pr_curve(px, py, ap, Path(save_dir) / f'{prefix}PR_curve.png', names)
-        plot_mc_curve(px, f1, Path(save_dir) / f'{prefix}F1_curve.png', names, ylabel='F1')
-        plot_mc_curve(px, p, Path(save_dir) / f'{prefix}P_curve.png', names, ylabel='Precision')
-        plot_mc_curve(px, r, Path(save_dir) / f'{prefix}R_curve.png', names, ylabel='Recall')
-
-    i = smooth(f1.mean(0), 0.1).argmax()  # max F1 index
-    p, r, f1 = p[:, i], r[:, i], f1[:, i]
-    tp = (r * nt).round()  # true positives
-    fp = (tp / (p + eps) - tp).round()  # false positives
-    return tp, fp, p, r, f1, ap, unique_classes.astype(int)
-
-
-def compute_ap(recall, precision):
-    """ Compute the average precision, given the recall and precision curves
-    # Arguments
-        recall:    The recall curve (list)
-        precision: The precision curve (list)
-    # Returns
-        Average precision, precision curve, recall curve
-    """
-
-    # Append sentinel values to beginning and end
-    mrec = np.concatenate(([0.0], recall, [1.0]))
-    mpre = np.concatenate(([1.0], precision, [0.0]))
-
-    # Compute the precision envelope
-    mpre = np.flip(np.maximum.accumulate(np.flip(mpre)))
-
-    # Integrate area under curve
-    method = 'interp'  # methods: 'continuous', 'interp'
-    if method == 'interp':
-        x = np.linspace(0, 1, 101)  # 101-point interp (COCO)
-        ap = np.trapz(np.interp(x, mrec, mpre), x)  # integrate
-    else:  # 'continuous'
-        i = np.where(mrec[1:] != mrec[:-1])[0]  # points where x axis (recall) changes
-        ap = np.sum((mrec[i + 1] - mrec[i]) * mpre[i + 1])  # area under curve
-
-    return ap, mpre, mrec
-
-
-class ConfusionMatrix:
-    # Updated version of https://github.com/kaanakan/object_detection_confusion_matrix
-    def __init__(self, nc, conf=0.25, iou_thres=0.45):
-        self.matrix = np.zeros((nc + 1, nc + 1))
-        self.nc = nc  # number of classes
-        self.conf = conf
-        self.iou_thres = iou_thres
-
-    def process_batch(self, detections, labels):
-        """
-        Return intersection-over-union (Jaccard index) of boxes.
-        Both sets of boxes are expected to be in (x1, y1, x2, y2) format.
-        Arguments:
-            detections (Array[N, 6]), x1, y1, x2, y2, conf, class
-            labels (Array[M, 5]), class, x1, y1, x2, y2
-        Returns:
-            None, updates confusion matrix accordingly
-        """
-        if detections is None:
-            gt_classes = labels.int()
-            for gc in gt_classes:
-                self.matrix[self.nc, gc] += 1  # background FN
-            return
-
-        detections = detections[detections[:, 4] > self.conf]
-        gt_classes = labels[:, 0].int()
-        detection_classes = detections[:, 5].int()
-        iou = box_iou(labels[:, 1:], detections[:, :4])
-
-        x = torch.where(iou > self.iou_thres)
-        if x[0].shape[0]:
-            matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()
-            if x[0].shape[0] > 1:
-                matches = matches[matches[:, 2].argsort()[::-1]]
-                matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
-                matches = matches[matches[:, 2].argsort()[::-1]]
-                matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
-        else:
-            matches = np.zeros((0, 3))
-
-        n = matches.shape[0] > 0
-        m0, m1, _ = matches.transpose().astype(int)
-        for i, gc in enumerate(gt_classes):
-            j = m0 == i
-            if n and sum(j) == 1:
-                self.matrix[detection_classes[m1[j]], gc] += 1  # correct
-            else:
-                self.matrix[self.nc, gc] += 1  # true background
-
-        if n:
-            for i, dc in enumerate(detection_classes):
-                if not any(m1 == i):
-                    self.matrix[dc, self.nc] += 1  # predicted background
-
-    def matrix(self):
-        return self.matrix
-
-    def tp_fp(self):
-        tp = self.matrix.diagonal()  # true positives
-        fp = self.matrix.sum(1) - tp  # false positives
-        # fn = self.matrix.sum(0) - tp  # false negatives (missed detections)
-        return tp[:-1], fp[:-1]  # remove background class
-
-    @TryExcept('WARNING ⚠️ ConfusionMatrix plot failure')
-    def plot(self, normalize=True, save_dir='', names=()):
-        import seaborn as sn
-
-        array = self.matrix / ((self.matrix.sum(0).reshape(1, -1) + 1E-9) if normalize else 1)  # normalize columns
-        array[array < 0.005] = np.nan  # don't annotate (would appear as 0.00)
-
-        fig, ax = plt.subplots(1, 1, figsize=(12, 9), tight_layout=True)
-        nc, nn = self.nc, len(names)  # number of classes, names
-        sn.set(font_scale=1.0 if nc < 50 else 0.8)  # for label size
-        labels = (0 < nn < 99) and (nn == nc)  # apply names to ticklabels
-        ticklabels = (names + ['background']) if labels else "auto"
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')  # suppress empty matrix RuntimeWarning: All-NaN slice encountered
-            sn.heatmap(array,
-                       ax=ax,
-                       annot=nc < 30,
-                       annot_kws={
-                           "size": 8},
-                       cmap='Blues',
-                       fmt='.2f',
-                       square=True,
-                       vmin=0.0,
-                       xticklabels=ticklabels,
-                       yticklabels=ticklabels).set_facecolor((1, 1, 1))
-        ax.set_ylabel('True')
-        ax.set_ylabel('Predicted')
-        ax.set_title('Confusion Matrix')
-        fig.savefig(Path(save_dir) / 'confusion_matrix.png', dpi=250)
-        plt.close(fig)
-
-    def print(self):
-        for i in range(self.nc + 1):
-            print(' '.join(map(str, self.matrix[i])))
-            
-
-class WIoU_Scale:
-    ''' monotonous: {
-            None: origin v1
-            True: monotonic FM v2
-            False: non-monotonic FM v3
-        }
-        momentum: The momentum of running mean'''
+    计算信息熵 (Entropy, EN)
     
-    iou_mean = 1.
-    monotonous = False
-    _momentum = 1 - 0.5 ** (1 / 7000)
-    _is_train = True
-
-    def __init__(self, iou):
-        self.iou = iou
-        self._update(self)
+    信息熵衡量图像的信息量，值越大表示图像包含的信息越丰富
     
-    @classmethod
-    def _update(cls, self):
-        if cls._is_train: cls.iou_mean = (1 - cls._momentum) * cls.iou_mean + \
-                                         cls._momentum * self.iou.detach().mean().item()
+    Args:
+        img: 图像张量, shape [B, C, H, W] 或 numpy数组
     
-    @classmethod
-    def _scaled_loss(cls, self, gamma=1.9, delta=3):
-        if isinstance(self.monotonous, bool):
-            if self.monotonous:
-                return (self.iou.detach() / self.iou_mean).sqrt()
-            else:
-                beta = self.iou.detach() / self.iou_mean
-                alpha = delta * torch.pow(gamma, beta - delta)
-                return beta / alpha
-        return 1
-
-
-def bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, MDPIoU=False, feat_h=640, feat_w=640, eps=1e-7):
-    # Returns Intersection over Union (IoU) of box1(1,4) to box2(n,4)
-
-    # Get the coordinates of bounding boxes
-    if xywh:  # transform from xywh to xyxy
-        (x1, y1, w1, h1), (x2, y2, w2, h2) = box1.chunk(4, -1), box2.chunk(4, -1)
-        w1_, h1_, w2_, h2_ = w1 / 2, h1 / 2, w2 / 2, h2 / 2
-        b1_x1, b1_x2, b1_y1, b1_y2 = x1 - w1_, x1 + w1_, y1 - h1_, y1 + h1_
-        b2_x1, b2_x2, b2_y1, b2_y2 = x2 - w2_, x2 + w2_, y2 - h2_, y2 + h2_
-    else:  # x1, y1, x2, y2 = box1
-        b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1)
-        b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, -1)
-        w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
-        w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
-
-    # Intersection area
-    inter = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0) * \
-            (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
-
-    # Union Area
-    union = w1 * h1 + w2 * h2 - inter + eps
-
-    # IoU
-    iou = inter / union
-    if CIoU or DIoU or GIoU:
-        cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)  # convex (smallest enclosing box) width
-        ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)  # convex height
-        if CIoU or DIoU:  # Distance or Complete IoU https://arxiv.org/abs/1911.08287v1
-            c2 = cw ** 2 + ch ** 2 + eps  # convex diagonal squared
-            rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2) ** 2 + (b2_y1 + b2_y2 - b1_y1 - b1_y2) ** 2) / 4  # center dist ** 2
-            if CIoU:  # https://github.com/Zzh-tju/DIoU-SSD-pytorch/blob/master/utils/box/box_utils.py#L47
-                v = (4 / math.pi ** 2) * torch.pow(torch.atan(w2 / h2) - torch.atan(w1 / h1), 2)
-                with torch.no_grad():
-                    alpha = v / (v - iou + (1 + eps))
-                return iou - (rho2 / c2 + v * alpha)  # CIoU
-            return iou - rho2 / c2  # DIoU
-        c_area = cw * ch + eps  # convex area
-        return iou - (c_area - union) / c_area  # GIoU https://arxiv.org/pdf/1902.09630.pdf
-    elif MDPIoU:
-        d1 = (b2_x1 - b1_x1) ** 2 + (b2_y1 - b1_y1) ** 2
-        d2 = (b2_x2 - b1_x2) ** 2 + (b2_y2 - b1_y2) ** 2
-        mpdiou_hw_pow = feat_h ** 2 + feat_w ** 2
-        return iou - d1 / mpdiou_hw_pow - d2 / mpdiou_hw_pow  # MPDIoU
-    return iou  # IoU
-
-
-def box_iou(box1, box2, eps=1e-7):
-    # https://github.com/pytorch/vision/blob/master/torchvision/ops/boxes.py
-    """
-    Return intersection-over-union (Jaccard index) of boxes.
-    Both sets of boxes are expected to be in (x1, y1, x2, y2) format.
-    Arguments:
-        box1 (Tensor[N, 4])
-        box2 (Tensor[M, 4])
     Returns:
-        iou (Tensor[N, M]): the NxM matrix containing the pairwise
-            IoU values for every element in boxes1 and boxes2
+        entropy: 信息熵值
     """
+    if isinstance(img, torch.Tensor):
+        img = img.detach().cpu().numpy()
+    
+    # 归一化到[0, 255]
+    img = ((img - img.min()) / (img.max() - img.min() + 1e-8) * 255).astype(np.uint8)
+    
+    # 计算直方图
+    hist, _ = np.histogram(img.flatten(), bins=256, range=(0, 256))
+    hist = hist / hist.sum()  # 归一化为概率分布
+    
+    # 计算熵
+    hist = hist[hist > 0]  # 移除零值
+    entropy = -np.sum(hist * np.log2(hist))
+    
+    return entropy
 
-    # inter(N,M) = (rb(N,M,2) - lt(N,M,2)).clamp(0).prod(2)
-    (a1, a2), (b1, b2) = box1.unsqueeze(1).chunk(2, 2), box2.unsqueeze(0).chunk(2, 2)
-    inter = (torch.min(a2, b2) - torch.max(a1, b1)).clamp(0).prod(2)
 
-    # IoU = inter / (area1 + area2 - inter)
-    return inter / ((a2 - a1).prod(2) + (b2 - b1).prod(2) - inter + eps)
-
-
-def bbox_ioa(box1, box2, eps=1e-7):
-    """Returns the intersection over box2 area given box1, box2. Boxes are x1y1x2y2
-    box1:       np.array of shape(nx4)
-    box2:       np.array of shape(mx4)
-    returns:    np.array of shape(nxm)
+def calculate_spatial_frequency(img):
     """
-
-    # Get the coordinates of bounding boxes
-    b1_x1, b1_y1, b1_x2, b1_y2 = box1.T
-    b2_x1, b2_y1, b2_x2, b2_y2 = box2.T
-
-    # Intersection area
-    inter_area = (np.minimum(b1_x2[:, None], b2_x2) - np.maximum(b1_x1[:, None], b2_x1)).clip(0) * \
-                 (np.minimum(b1_y2[:, None], b2_y2) - np.maximum(b1_y1[:, None], b2_y1)).clip(0)
-
-    # box2 area
-    box2_area = (b2_x2 - b2_x1) * (b2_y2 - b2_y1) + eps
-
-    # Intersection over box2 area
-    return inter_area / box2_area
-
-
-def wh_iou(wh1, wh2, eps=1e-7):
-    # Returns the nxm IoU matrix. wh1 is nx2, wh2 is mx2
-    wh1 = wh1[:, None]  # [N,1,2]
-    wh2 = wh2[None]  # [1,M,2]
-    inter = torch.min(wh1, wh2).prod(2)  # [N,M]
-    return inter / (wh1.prod(2) + wh2.prod(2) - inter + eps)  # iou = inter / (area1 + area2 - inter)
-
-
-# Plots ----------------------------------------------------------------------------------------------------------------
-
-
-@threaded
-def plot_pr_curve(px, py, ap, save_dir=Path('pr_curve.png'), names=()):
-    # Precision-recall curve
-    fig, ax = plt.subplots(1, 1, figsize=(9, 6), tight_layout=True)
-    py = np.stack(py, axis=1)
-
-    if 0 < len(names) < 21:  # display per-class legend if < 21 classes
-        for i, y in enumerate(py.T):
-            ax.plot(px, y, linewidth=1, label=f'{names[i]} {ap[i, 0]:.3f}')  # plot(recall, precision)
-    else:
-        ax.plot(px, py, linewidth=1, color='grey')  # plot(recall, precision)
-
-    ax.plot(px, py.mean(1), linewidth=3, color='blue', label='all classes %.3f mAP@0.5' % ap[:, 0].mean())
-    ax.set_xlabel('Recall')
-    ax.set_ylabel('Precision')
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.legend(bbox_to_anchor=(1.04, 1), loc="upper left")
-    ax.set_title('Precision-Recall Curve')
-    fig.savefig(save_dir, dpi=250)
-    plt.close(fig)
+    计算空间频率 (Spatial Frequency, SF)
+    
+    空间频率衡量图像的清晰度，值越大表示图像越清晰
+    
+    Args:
+        img: 图像张量, shape [B, C, H, W] 或 numpy数组
+    
+    Returns:
+        sf: 空间频率值
+    """
+    if isinstance(img, torch.Tensor):
+        img = img.detach().cpu().numpy()
+    
+    # 确保是单通道
+    if img.ndim == 4:
+        img = img[0, 0]  # 取第一个batch的第一个通道
+    elif img.ndim == 3:
+        img = img[0]
+    
+    H, W = img.shape
+    
+    # 行频率 (Row Frequency)
+    RF = 0
+    for i in range(H):
+        for j in range(W - 1):
+            RF += (img[i, j] - img[i, j + 1]) ** 2
+    RF = np.sqrt(RF / (H * W))
+    
+    # 列频率 (Column Frequency)
+    CF = 0
+    for i in range(H - 1):
+        for j in range(W):
+            CF += (img[i, j] - img[i + 1, j]) ** 2
+    CF = np.sqrt(CF / (H * W))
+    
+    # 空间频率
+    sf = np.sqrt(RF ** 2 + CF ** 2)
+    
+    return sf
 
 
-@threaded
-def plot_mc_curve(px, py, save_dir=Path('mc_curve.png'), names=(), xlabel='Confidence', ylabel='Metric'):
-    # Metric-confidence curve
-    fig, ax = plt.subplots(1, 1, figsize=(9, 6), tight_layout=True)
+def calculate_ssim(img1, img2, window_size=11):
+    """
+    计算结构相似性 (Structural Similarity, SSIM)
+    
+    SSIM衡量两张图像的结构相似性，值越大越相似，范围[-1, 1]
+    
+    Args:
+        img1: 图像1, shape [B, C, H, W] 或 numpy数组
+        img2: 图像2, shape [B, C, H, W] 或 numpy数组
+        window_size: 窗口大小 (默认11)
+    
+    Returns:
+        ssim: SSIM值
+    """
+    if isinstance(img1, np.ndarray):
+        img1 = torch.from_numpy(img1).float()
+    if isinstance(img2, np.ndarray):
+        img2 = torch.from_numpy(img2).float()
+    
+    # 确保在同一设备
+    device = img1.device
+    img2 = img2.to(device)
+    
+    # 创建高斯窗口
+    def gaussian(window_size, sigma=1.5):
+        gauss = torch.Tensor([
+            math.exp(-(x - window_size//2)**2 / float(2*sigma**2))
+            for x in range(window_size)
+        ])
+        return gauss / gauss.sum()
+    
+    def create_window(window_size, channel):
+        _1D_window = gaussian(window_size).unsqueeze(1)
+        _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
+        window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
+        return window
+    
+    channel = img1.size(1)
+    window = create_window(window_size, channel).to(device)
+    
+    mu1 = F.conv2d(img1, window, padding=window_size//2, groups=channel)
+    mu2 = F.conv2d(img2, window, padding=window_size//2, groups=channel)
+    
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
+    
+    sigma1_sq = F.conv2d(img1*img1, window, padding=window_size//2, groups=channel) - mu1_sq
+    sigma2_sq = F.conv2d(img2*img2, window, padding=window_size//2, groups=channel) - mu2_sq
+    sigma12 = F.conv2d(img1*img2, window, padding=window_size//2, groups=channel) - mu1_mu2
+    
+    C1 = 0.01**2
+    C2 = 0.03**2
+    
+    ssim_map = ((2*mu1_mu2 + C1)*(2*sigma12 + C2)) / ((mu1_sq + mu2_sq + C1)*(sigma1_sq + sigma2_sq + C2))
+    
+    return ssim_map.mean().item()
 
-    if 0 < len(names) < 21:  # display per-class legend if < 21 classes
-        for i, y in enumerate(py):
-            ax.plot(px, y, linewidth=1, label=f'{names[i]}')  # plot(confidence, metric)
-    else:
-        ax.plot(px, py.T, linewidth=1, color='grey')  # plot(confidence, metric)
 
-    y = smooth(py.mean(0), 0.05)
-    ax.plot(px, y, linewidth=3, color='blue', label=f'all classes {y.max():.2f} at {px[y.argmax()]:.3f}')
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.legend(bbox_to_anchor=(1.04, 1), loc="upper left")
-    ax.set_title(f'{ylabel}-Confidence Curve')
-    fig.savefig(save_dir, dpi=250)
-    plt.close(fig)
+def calculate_mutual_information(img1, img2, bins=256):
+    """
+    计算互信息 (Mutual Information, MI)
+    
+    互信息衡量两张图像之间的相关性，值越大表示融合图像保留了更多源图像的信息
+    
+    Args:
+        img1: 图像1, shape [B, C, H, W] 或 numpy数组
+        img2: 图像2, shape [B, C, H, W] 或 numpy数组
+        bins: 直方图bins数量 (默认256)
+    
+    Returns:
+        mi: 互信息值
+    """
+    if isinstance(img1, torch.Tensor):
+        img1 = img1.detach().cpu().numpy()
+    if isinstance(img2, torch.Tensor):
+        img2 = img2.detach().cpu().numpy()
+    
+    # 归一化到[0, bins-1]
+    img1 = ((img1 - img1.min()) / (img1.max() - img1.min() + 1e-8) * (bins - 1)).astype(np.int32)
+    img2 = ((img2 - img2.min()) / (img2.max() - img2.min() + 1e-8) * (bins - 1)).astype(np.int32)
+    
+    # 计算联合直方图
+    hist_2d, _, _ = np.histogram2d(img1.flatten(), img2.flatten(), bins=bins)
+    
+    # 归一化为联合概率分布
+    pxy = hist_2d / hist_2d.sum()
+    
+    # 计算边缘概率分布
+    px = pxy.sum(axis=1)
+    py = pxy.sum(axis=0)
+    
+    # 计算互信息
+    px_py = px[:, None] * py[None, :]
+    
+    # 只计算非零项
+    nzs = pxy > 0
+    mi = np.sum(pxy[nzs] * np.log2(pxy[nzs] / px_py[nzs]))
+    
+    return mi
+
+
+def calculate_all_metrics(fused, img1, img2):
+    """
+    计算所有评估指标
+    
+    Args:
+        fused: 融合图像, shape [B, C, H, W]
+        img1: 源图像1, shape [B, C, H, W]
+        img2: 源图像2, shape [B, C, H, W]
+    
+    Returns:
+        metrics: 包含所有指标的字典
+    """
+    metrics = {}
+    
+    # 信息熵
+    metrics['EN'] = calculate_entropy(fused)
+    
+    # 空间频率
+    metrics['SF'] = calculate_spatial_frequency(fused)
+    
+    # SSIM (与两个源图像的平均)
+    ssim1 = calculate_ssim(fused, img1)
+    ssim2 = calculate_ssim(fused, img2)
+    metrics['SSIM'] = (ssim1 + ssim2) / 2
+    
+    # 互信息 (与两个源图像的总和)
+    mi1 = calculate_mutual_information(fused, img1)
+    mi2 = calculate_mutual_information(fused, img2)
+    metrics['MI'] = mi1 + mi2
+    
+    return metrics
+
+
+# 别名，方便导入
+calculate_metrics = calculate_all_metrics
+
+
+def print_metrics(metrics, title="Evaluation Metrics"):
+    """
+    打印评估指标
+    
+    Args:
+        metrics: 指标字典
+        title: 标题
+    """
+    print(f"\n{title}")
+    print("=" * 50)
+    for key, value in metrics.items():
+        print(f"  {key:10s}: {value:.6f}")
+    print("=" * 50)
+
+
+# 测试代码
+if __name__ == "__main__":
+    print("=" * 70)
+    print("Fusion Metrics Test")
+    print("=" * 70)
+    
+    # 检查CUDA
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"\n使用设备: {device}")
+    
+    # 创建测试数据
+    batch_size = 1
+    img_size = 256
+    
+    # 创建有意义的测试图像（而不是随机噪声）
+    # 图像1: 水平渐变
+    img1 = torch.linspace(0, 1, img_size).view(1, img_size).repeat(img_size, 1)
+    img1 = img1.unsqueeze(0).unsqueeze(0).to(device)
+    
+    # 图像2: 垂直渐变
+    img2 = torch.linspace(0, 1, img_size).view(img_size, 1).repeat(1, img_size)
+    img2 = img2.unsqueeze(0).unsqueeze(0).to(device)
+    
+    # 融合图像: 简单平均
+    fused = (img1 + img2) / 2
+    
+    print(f"\n测试数据:")
+    print(f"  - 图像1: 水平渐变, 形状 {img1.shape}")
+    print(f"  - 图像2: 垂直渐变, 形状 {img2.shape}")
+    print(f"  - 融合图像: 简单平均, 形状 {fused.shape}")
+    
+    # 测试信息熵
+    print(f"\n测试信息熵 (EN)...")
+    en = calculate_entropy(fused)
+    print(f"  ✓ 融合图像信息熵: {en:.6f}")
+    print(f"    (参考: 图像1 EN = {calculate_entropy(img1):.6f})")
+    print(f"    (参考: 图像2 EN = {calculate_entropy(img2):.6f})")
+    
+    # 测试空间频率
+    print(f"\n测试空间频率 (SF)...")
+    sf = calculate_spatial_frequency(fused)
+    print(f"  ✓ 融合图像空间频率: {sf:.6f}")
+    print(f"    (参考: 图像1 SF = {calculate_spatial_frequency(img1):.6f})")
+    print(f"    (参考: 图像2 SF = {calculate_spatial_frequency(img2):.6f})")
+    
+    # 测试SSIM
+    print(f"\n测试结构相似性 (SSIM)...")
+    ssim1 = calculate_ssim(fused, img1)
+    ssim2 = calculate_ssim(fused, img2)
+    print(f"  ✓ 融合图像与图像1的SSIM: {ssim1:.6f}")
+    print(f"  ✓ 融合图像与图像2的SSIM: {ssim2:.6f}")
+    print(f"  ✓ 平均SSIM: {(ssim1 + ssim2) / 2:.6f}")
+    
+    # 测试互信息
+    print(f"\n测试互信息 (MI)...")
+    mi1 = calculate_mutual_information(fused, img1)
+    mi2 = calculate_mutual_information(fused, img2)
+    print(f"  ✓ 融合图像与图像1的MI: {mi1:.6f}")
+    print(f"  ✓ 融合图像与图像2的MI: {mi2:.6f}")
+    print(f"  ✓ 总MI: {mi1 + mi2:.6f}")
+    
+    # 测试所有指标
+    print(f"\n测试所有指标...")
+    metrics = calculate_all_metrics(fused, img1, img2)
+    print_metrics(metrics, "融合图像评估指标")
+    
+    print("\n" + "=" * 70)
+    print("✓ 评估指标测试通过!")
+    print("=" * 70)
+    print("\n指标说明:")
+    print("  - EN (信息熵): 越大越好，表示图像信息量丰富")
+    print("  - SF (空间频率): 越大越好，表示图像清晰度高")
+    print("  - SSIM (结构相似性): 越接近1越好，表示保留了源图像结构")
+    print("  - MI (互信息): 越大越好，表示保留了源图像信息")
