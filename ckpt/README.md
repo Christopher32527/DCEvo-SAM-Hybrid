@@ -3,10 +3,22 @@
 本目录需要放置以下权重文件:
 
 ## 1. DCEvo融合权重
-- 文件名: `DCEvo_fusion.pth`
-- 大小: ~XX MB
-- 说明: DCEvo图像融合模型权重
-- 下载: [提供下载链接或联系方式]
+
+### DCEvo官方权重下载
+所有DCEvo预训练权重可从官方仓库下载:
+- **GitHub仓库**: https://github.com/Beate-Suy-Zhang/DCEvo/tree/main/ckpt
+
+### 可用的权重文件:
+- `DCEvo_fusion.pth` - DCEvo图像融合模型权重
+- `DCEvo_fusion_branch.pth` - DCEvo融合分支权重
+- `DCEvo_detect_branch.pt` - DCEvo检测分支权重
+- `pretrained_yolov8s.pt` - 预训练YOLOv8s权重
+
+**下载方式**:
+1. 访问: https://github.com/Beate-Suy-Zhang/DCEvo/tree/main/ckpt
+2. 点击需要的权重文件
+3. 点击 "Download" 按钮下载
+4. 将下载的文件放到本目录 (`DCEvo-SAM-Hybrid/ckpt/`)
 
 ## 2. SAM分割权重 (选择一个)
 
@@ -27,8 +39,17 @@
 
 ## 下载后放置位置
 ```
-DCEvo-main/
+DCEvo-SAM-Hybrid/
 └── ckpt/
-    ├── DCEvo_fusion.pth          ← 必需
-    └── sam_vit_b_01ec64.pth      ← 必需 (选一个)
+    ├── DCEvo_fusion.pth          ← 必需 (医学图像融合训练)
+    ├── DCEvo_fusion_branch.pth   ← 可选
+    ├── DCEvo_detect_branch.pt    ← 可选
+    ├── pretrained_yolov8s.pt     ← 可选
+    └── sam_vit_b_01ec64.pth      ← 必需 (如果使用SAM分割)
 ```
+
+## 注意事项
+- ⚠️ 权重文件较大，不包含在Git仓库中
+- ✅ 下载后请确保文件名正确
+- ✅ 医学图像融合训练至少需要 `DCEvo_fusion.pth`
+- ✅ 如果使用SAM分割功能，还需要下载SAM权重
