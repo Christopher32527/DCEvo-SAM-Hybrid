@@ -1,0 +1,169 @@
+# DCEvo-FAM医学图像融合训练配置 - RTX 4090优化版
+# CT + T1-MRI 融合任务
+# 作者: Christopher32527
+# 
+# 🚀 RTX 4090 24GB 优化配置
+# 相比8GB版本的改进:
+# - 更大图像尺寸 (256)
+# - 更大batch_size (8)
+# - 更多模型参数 (fam_feature_dim: 512, num_blocks: 5)
+# - 混合精度训练加速
+
+# ==================== 数据配置 ====================
+data:
+  # 数据集根目录
+  data_root: "datasets/Paired MRI (T1, T2) and CT Scans Dataset"
+  
+  # 模态选择 (CT, T1-MRI, T2-MRI)
+  modality_a: "CT"
+  modality_b: "T1-MRI"
+  
+  # 数据集划分比例
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  
+  # 随机种子
+  seed: 2025
+  
+  # 图像尺寸 - RTX 4090优化
+  img_size: 256
+  
+  # 数据增强
+  augment: true
+  
+  # 归一化
+  normalize: true
+
+# ==================== 模型配置 ====================
+model:
+  # 模型名称
+  name: "DCEvoFAMHybrid"
+  
+  # 输入输出通道数
+  in_channels: 1
+  out_channels: 1
+  
+  # DCEvo特征维度 (sleepnet.py硬编码，不可修改)
+  dim: 64
+  
+  # FAM特征维度 - RTX 4090优化
+  fam_feature_dim: 512
+  
+  # FAM频率截止阈值 (低频/高频分界点)
+  fam_cutoff: 0.3
+  
+  # DCEvo编码器块数量 - RTX 4090优化
+  num_blocks: 5
+
+# ==================== 训练配置 ====================
+training:
+  # 训练轮数
+  epochs: 150
+  
+  # 批次大小 - RTX 4090优化
+  batch_size: 8
+  
+  # 学习率
+  learning_rate: 0.0002
+  
+  # 优化器 (adam, adamw, sgd)
+  optimizer: "adamw"
+  
+  # 权重衰减
+  weight_decay: 0.01
+  
+  # 学习率调度器 (step, cosine, plateau)
+  lr_scheduler: "cosine"
+  
+  # StepLR参数
+  step_size: 30
+  gamma: 0.5
+  
+  # ReduceLROnPlateau参数
+  patience: 15
+  factor: 0.5
+  
+  # 梯度裁剪
+  grad_clip: 1.0
+  
+  # 数据加载线程数 - 多核CPU优化
+  num_workers: 8
+  
+  # 混合精度训练 - RTX 4090优化
+  use_amp: true
+  
+  # 早停机制
+  early_stopping:
+    enabled: true
+    patience: 25
+    min_delta: 0.0001
+
+# ==================== 损失函数配置 ====================
+loss:
+  # SSIM损失权重
+  ssim_weight: 1.0
+  
+  # 梯度损失权重
+  gradient_weight: 10.0
+  
+  # 强度损失权重
+  intensity_weight: 1.0
+  
+  # SSIM窗口大小
+  window_size: 11
+
+# ==================== 验证配置 ====================
+validation:
+  # 验证频率 (每N个epoch验证一次)
+  val_interval: 1
+  
+  # 是否保存验证图像
+  save_images: true
+  
+  # 保存图像数量
+  num_save_images: 10
+
+# ==================== 保存配置 ====================
+save:
+  # 保存目录
+  save_dir: "runs/medical_fusion"
+  
+  # 实验名称
+  exp_name: "ct_t1mri_fusion_rtx4090"
+  
+  # 是否保存最佳模型
+  save_best: true
+  
+  # 是否保存最后模型
+  save_last: true
+  
+  # 保存检查点频率 (每N个epoch保存一次)
+  save_interval: 10
+
+# ==================== 日志配置 ====================
+logging:
+  # 是否使用TensorBoard
+  use_tensorboard: true
+  
+  # 日志打印频率 (每N个batch打印一次)
+  print_interval: 5
+  
+  # 是否保存训练日志到文件
+  save_log: true
+
+# ==================== 设备配置 ====================
+device:
+  # 使用的设备 (cuda, cpu, auto)
+  type: "auto"
+  
+  # GPU ID (如果有多个GPU)
+  gpu_id: 0
+
+# ==================== 恢复训练配置 ====================
+resume:
+  # 是否恢复训练
+  enabled: false
+  
+  # 检查点路径
+  checkpoint_path: ""
